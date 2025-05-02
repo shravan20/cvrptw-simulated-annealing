@@ -1,5 +1,3 @@
-# file: sa_cvrptw.py
-
 import random
 import math
 import matplotlib.pyplot as plt
