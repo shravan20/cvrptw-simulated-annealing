@@ -1,1135 +1,445 @@
-import json
-import math
+# file: sa_cvrptw.py
+
 import random
+import math
+import matplotlib.pyplot as plt
+from typing import List, Dict, Tuple
 import copy
-
-# Set a random seed for reproducibility
-random.seed(42)
-
-
-# Haversine formula to calculate distance between two lat/lng points
-def haversine_distance(lat1, lng1, lat2, lng2):
-    R = 6371  # Radius of the Earth in kilometers
-    lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
-    dlat = lat2 - lat1
-    dlng = lat2 - lng1
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c  # Distance in kilometers
+from multiprocessing import Pool, cpu_count
+from geopy.distance import geodesic
+from shapely.geometry import MultiPoint
+from shapely.geometry.polygon import Polygon
 
 
-# Calculate the total distance for all vehicle routes
-def total_distance(routes, depot_location, weight_distance, weight_time):
-    total_dist = 0
-    depot_lat, depot_lng = depot_location["lat"], depot_location["lng"]
+# ---- Global Seed ----
+SEED = 42
+random.seed(SEED)
+DEBUG=True
+# ---- Data Classes ----
 
-    # For demonstration, let's assume we also have time calculations.
-    total_time = (
-        0  # Placeholder for total time (can be replaced with actual time calculation)
-    )
-
-    for route in routes:
-        prev_lat, prev_lng = depot_lat, depot_lng
-        for order in route:
-            distance = haversine_distance(
-                prev_lat, prev_lng, order["location"]["lat"], order["location"]["lng"]
-            )
-            total_dist += distance
-            total_time += distance / 30  # Assuming an average speed of 30 km/h
-            prev_lat, prev_lng = order["location"]["lat"], order["location"]["lng"]
-        total_dist += haversine_distance(
-            prev_lat, prev_lng, depot_lat, depot_lng
-        )  # Return to depot
-
-    # Combine distance and time into a weighted score
-    score = (weight_distance * total_dist) + (weight_time * total_time)
-    return score, total_dist, total_time
+class Location:
+    def __init__(self, id: int, lat: float, lon: float):
+        self.id = id
+        self.lat = lat
+        self.lon = lon
 
 
-# Generate a random neighbor using different types of moves
-def generate_neighbor(routes):
-    move_type = random.choice(["swap", "relocate", "2-opt", "multiple_swap"])
-    if move_type == "swap":
-        return swap_move(routes)
-    elif move_type == "relocate":
-        return relocate_move(routes)
-    elif move_type == "2-opt":
-        return two_opt_move(routes)
-    elif move_type == "multiple_swap":
-        return multiple_swap_move(routes)
+distance_matrix = {}  # global for reuse
+def build_distance_matrix(locations: List[Location]) -> Dict[Tuple[int, int], float]:
+      matrix = {}
+      for i in range(len(locations)):
+          for j in range(len(locations)):
+              a, b = locations[i], locations[j]
+              matrix[(a.id, b.id)] = geodesic((a.lat, a.lon), (b.lat, b.lon)).km
+      return matrix
+
+        
+
+class Order:
+    def __init__(self, id: int, pickup: Location, delivery: Location,
+                 time_window: Tuple[float, float], demand: int):
+        self.id = id
+        self.pickup = pickup
+        self.delivery = delivery
+        self.time_window = time_window
+        self.demand = demand
+
+class Vehicle:
+    def __init__(self, id: int, capacity: int, start: Location, end: Location,
+                 location_limits: Tuple[float, float, float, float] = (-90, 90, -180, 180),
+                 total_distance_limit: float = float('inf'),
+                 travel_distance_limit: float = float('inf'),
+                 total_time_limit: float = float('inf'),
+                 travel_time_limit: float = float('inf')):
+        self.id = id
+        self.capacity = capacity
+        self.start = start
+        self.end = end
+        self.location_limits = location_limits
+        self.total_distance_limit = total_distance_limit
+        self.travel_distance_limit = travel_distance_limit
+        self.total_time_limit = total_time_limit
+        self.travel_time_limit = travel_time_limit
+
+# ---- Helper Functions ----
+
+def compute_convex_hull(route: List[Location]) -> Polygon:
+    points = [(p.lon, p.lat) for p in route]
+    return MultiPoint(points).convex_hull
+
+def hulls_intersect(hull1: Polygon, hull2: Polygon) -> bool:
+    return hull1.intersects(hull2)
 
 
-# Swap move: Swap two orders between two routes
-def swap_move(routes):
-    new_routes = copy.deepcopy(routes)
-    route1, route2 = random.sample(range(len(new_routes)), 2)
-    if len(new_routes[route1]) > 0 and len(new_routes[route2]) > 0:
-        i, j = random.randint(0, len(new_routes[route1]) - 1), random.randint(
-            0, len(new_routes[route2]) - 1
-        )
-        new_routes[route1][i], new_routes[route2][j] = (
-            new_routes[route2][j],
-            new_routes[route1][i],
-        )
-    return new_routes
 
+def total_distance(route: List[Location]) -> float:
+    return sum(distance_matrix[(route[i].id, route[i+1].id)] for i in range(len(route) - 1))
 
-# Multiple swaps: Swap multiple pairs of orders between routes
-def multiple_swap_move(routes):
-    new_routes = copy.deepcopy(routes)
-    for _ in range(random.randint(2, 4)):  # Number of swaps can be configured
-        route1, route2 = random.sample(range(len(new_routes)), 2)
-        if len(new_routes[route1]) > 0 and len(new_routes[route2]) > 0:
-            i, j = random.randint(0, len(new_routes[route1]) - 1), random.randint(
-                0, len(new_routes[route2]) - 1
-            )
-            new_routes[route1][i], new_routes[route2][j] = (
-                new_routes[route2][j],
-                new_routes[route1][i],
-            )
-    return new_routes
+def evaluate_candidate(args):
+    solution, vehicles, overlap_weight, strict_overlap = args
+    score = evaluate_solution(solution, vehicles,
+                              overlap_weight=overlap_weight,
+                              strict_overlap=strict_overlap)
+    return (solution, score)
 
-
-# Relocate move: Move one order from one route to another
-def relocate_move(routes):
-    new_routes = copy.deepcopy(routes)
-    route1, route2 = random.sample(range(len(new_routes)), 2)
-    if len(new_routes[route1]) > 0:
-        i = random.randint(0, len(new_routes[route1]) - 1)
-        order = new_routes[route1].pop(i)
-        insert_position = random.randint(0, len(new_routes[route2]))
-        new_routes[route2].insert(insert_position, order)
-    return new_routes
-
-
-# 2-opt move: Reverse a segment of a route to reduce distance
-def two_opt_move(routes):
-    new_routes = copy.deepcopy(routes)
-    route = random.choice(new_routes)
-    if len(route) > 2:
-        i, j = sorted(random.sample(range(len(route)), 2))
-        route[i : j + 1] = reversed(route[i : j + 1])
-    return new_routes
-
-
-# Check if a solution is valid (no vehicle exceeds its capacity)
-def is_valid(routes, vehicles):
-    for i, route in enumerate(routes):
-        total_weight = sum(order["weight"] for order in route)
-        total_volume = sum(order["volume"] for order in route)
-        if (
-            total_weight > vehicles[i]["capacity_weight"]
-            or total_volume > vehicles[i]["capacity_volume"]
-        ):
-            return False
-    return True
-
-
-# Simulated Annealing algorithm with multiple moves
-def simulated_annealing(
-    vehicles,
-    orders,
-    depot_location,
-    initial_temp,
-    cooling_rate,
-    max_iterations,
-    weight_distance,
-    weight_time,
-):
-    # Initial random solution
-    routes = [[] for _ in vehicles]
+def create_initial_solution(orders: List[Order], vehicles: List[Vehicle]) -> Dict[int, List[Order]]:
+    solution = {v.id: [] for v in vehicles}
     random.shuffle(orders)
     for i, order in enumerate(orders):
-        routes[i % len(vehicles)].append(order)
+        solution[vehicles[i % len(vehicles)].id].append(order)
+    return solution
 
-    current_solution = routes
-    current_score, current_distance, current_time = total_distance(
-        current_solution, depot_location, weight_distance, weight_time
-    )
+def evaluate_solution(solution: Dict[int, List[Order]], vehicles: List[Vehicle],
+                      unassigned_orders: List[Order] = [],
+                      weights: Dict[str, float] = None,
+                      leniency: Dict[str, float] = None,
+                      overlap_weight: float = 0.000001, 
+                      strict_overlap: bool = True) -> float:
+  
 
-    best_solution = copy.deepcopy(current_solution)
-    best_score = current_score
+    if weights is None:
+        weights = {
+            'distance': 1.0,
+            'time_penalty': 100.0,
+            'capacity_penalty': 100.0,
+            'unassigned_penalty': 500.0
+        }
 
-    temperature = initial_temp
+    if leniency is None:
+        leniency = {
+            'total_distance': 0.0,
+            'travel_distance': 0.0,
+            'total_time': 0.0,
+            'travel_time': 0.0
+        }
 
-    for iteration in range(max_iterations):
-        if temperature <= 0:
+    cost = 0
+    penalty = 1e6
+
+    for v in vehicles:
+        if DEBUG:
+          print(f"Evaluating vehicle {v.id} with {len(solution[v.id])} orders")
+        route = [v.start]
+        load = 0
+        time_penalty = 0
+        curr_time = 0
+        total_travel_distance = 0
+        min_lat, max_lat, min_lon, max_lon = v.location_limits
+        hulls = []
+        for o in solution[v.id]:
+            for point in [o.pickup, o.delivery]:
+                prev = route[-1]
+                dist = distance_matrix[(prev.id, point.id)]
+                total_travel_distance += dist
+                curr_time += dist / 30.0
+
+                if not (min_lat <= point.lat <= max_lat and min_lon <= point.lon <= max_lon):
+                    return penalty
+
+                tw_start, tw_end = o.time_window
+                if curr_time < tw_start:
+                    time_penalty += (tw_start - curr_time)
+                    curr_time = tw_start
+                elif curr_time > tw_end:
+                    time_penalty += (curr_time - tw_end)
+
+                route.append(point)
+            load += o.demand
+
+        route.append(v.end)
+        total_dist = total_distance(route)
+
+        if total_dist > v.total_distance_limit * (1 + leniency['total_distance']):
+            return penalty
+        if total_travel_distance > v.travel_distance_limit * (1 + leniency['travel_distance']):
+            return penalty
+        if curr_time > v.total_time_limit * (1 + leniency['total_time']):
+            return penalty
+        if curr_time > v.travel_time_limit * (1 + leniency['travel_time']):
+            return penalty
+        if overlap_weight > 0 or strict_overlap:
+          for i in range(len(hulls)):
+              for j in range(i + 1, len(hulls)):
+                  if hulls_intersect(hulls[i], hulls[j]):
+                      if strict_overlap:
+                          return penalty
+                      else:
+                          cost += overlap_weight        
+
+        hull = compute_convex_hull(route)
+        hulls.append(hull)
+        if overlap_weight > 0 or strict_overlap:
+          for i in range(len(hulls)):
+              for j in range(i + 1, len(hulls)):
+                  if hulls_intersect(hulls[i], hulls[j]):
+                      if strict_overlap:
+                          return penalty
+                      else:
+                          cost += overlap_weight
+
+
+        capacity_penalty = max(0, load - v.capacity)
+        cost += (weights['distance'] * total_dist +
+                 weights['time_penalty'] * time_penalty +
+                 weights['capacity_penalty'] * capacity_penalty)
+
+    cost += weights['unassigned_penalty'] * len(unassigned_orders)
+    return cost
+
+# ---- Remaining Functions Unchanged ----
+
+# ---- Neighborhood Operators ----
+
+def apply_2opt(orders: List[Order]) -> List[Order]:
+    if len(orders) < 2: return orders[:]
+    i, j = sorted(random.sample(range(len(orders)), 2))
+    return orders[:i] + list(reversed(orders[i:j+1])) + orders[j+1:]
+
+def apply_3opt(orders: List[Order]) -> List[Order]:
+    if len(orders) < 3: return orders[:]
+    i, j, k = sorted(random.sample(range(len(orders)), 3))
+    return orders[:i] + list(reversed(orders[i:j])) + list(reversed(orders[j:k])) + orders[k:]
+
+def tour_swap(solution: Dict[int, List[Order]]) -> Dict[int, List[Order]]:
+    s = copy.deepcopy(solution)
+    v1, v2 = random.sample(list(s.keys()), 2)
+    s[v1], s[v2] = s[v2], s[v1]
+    return s
+
+def tour_merge(solution: Dict[int, List[Order]]) -> Dict[int, List[Order]]:
+    s = copy.deepcopy(solution)
+    v1, v2 = random.sample(list(s.keys()), 2)
+    merged = s[v1] + s[v2]
+    random.shuffle(merged)
+    s[v1], s[v2] = merged[:len(merged)//2], merged[len(merged)//2:]
+    return s
+
+def split_insert(solution: Dict[int, List[Order]]) -> Dict[int, List[Order]]:
+    s = copy.deepcopy(solution)
+    all_orders = [o for lst in s.values() for o in lst]
+    if not all_orders: return s
+    sel = random.choice(all_orders)
+    for v in s:
+        if sel in s[v]:
+            s[v].remove(sel)
+            break
+    tgt = random.choice(list(s.keys()))
+    pos = random.randint(0, len(s[tgt]))
+    s[tgt].insert(pos, sel)
+    return s
+
+def destroy_and_repair(solution: Dict[int, List[Order]]) -> Dict[int, List[Order]]:
+    s = copy.deepcopy(solution)
+    all_orders = [o for lst in s.values() for o in lst]
+    if len(all_orders) < 2: return s
+    removed = random.sample(all_orders, max(1, len(all_orders) // 4))
+    for v in s: s[v] = [o for o in s[v] if o not in removed]
+    for o in removed:
+        random.choice(list(s.values())).append(o)
+    return s
+
+def generate_neighbor(solution: Dict[int, List[Order]],
+                      vehicles: List[Vehicle],
+                      overlap_weight: float = 0.0,
+                      strict_overlap: bool = True) -> Dict[int, List[Order]]:
+
+    candidates = []
+    for vid in solution:
+        for op in [apply_2opt, apply_3opt]:
+            new_sol = copy.deepcopy(solution)
+            new_sol[vid] = op(new_sol[vid])
+            candidates.append(new_sol)
+
+    for op in [tour_swap, tour_merge, split_insert, destroy_and_repair]:
+        candidates.append(op(solution))
+
+    args = [(c, vehicles, overlap_weight, strict_overlap) for c in candidates]
+
+    with Pool(processes=min(cpu_count(), len(candidates))) as pool:
+        scored = pool.map(evaluate_candidate, args)
+
+    return min(scored, key=lambda x: x[1])[0]
+
+
+
+# ---- Simulated Annealing ----
+
+def simulated_annealing(orders: List[Order], vehicles: List[Vehicle], T=1000, alpha=0.95, T_min=0.01, iters=1000):
+    current = create_initial_solution(orders, vehicles)
+    cost = evaluate_solution(current, vehicles)
+    best = current
+    best_cost = cost
+    T_current = T
+    history, temps = [cost], [T_current]
+    no_improve_iters = 0  # <-- NEW
+    print("Start simulated annealing")
+
+    for _ in range(iters):
+        if DEBUG:
+            print(f"Iteration {_}, Temp: {T_current:.4f}, Cost: {cost:.2f}, Best: {best_cost:.2f}")
+        neighbor = generate_neighbor(current, vehicles, overlap_weight=500.0,strict_overlap=False)
+        new_cost = evaluate_solution(neighbor, vehicles)
+        delta = new_cost - cost
+        if delta < 0 or random.random() < math.exp(-delta / T_current):
+            current = neighbor
+            cost = new_cost
+            if cost < best_cost:
+                best = current
+                best_cost = cost
+                no_improve_iters = 0  # <-- RESET
+            else:
+                no_improve_iters += 1
+        else:
+            no_improve_iters += 1
+
+        T_current *= alpha
+        history.append(cost)
+        temps.append(T_current)
+
+        if T_current < T_min or no_improve_iters >= 1000:  # <-- EARLY EXIT
             break
 
-        new_solution = generate_neighbor(current_solution)
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history)
+    plt.title('Cost')
+    plt.subplot(1, 2, 2)
+    plt.plot(temps)
+    plt.title('Temperature')
+    plt.show()
 
-        if not is_valid(new_solution, vehicles):
-            continue
-
-        new_score, new_distance, new_time = total_distance(
-            new_solution, depot_location, weight_distance, weight_time
-        )
-
-        accepted = False
-        # Accept new solution with a probability based on temperature
-        if new_score < current_score or random.uniform(0, 1) < math.exp(
-            (current_score - new_score) / temperature
-        ):
-            current_solution = new_solution
-            current_score = new_score
-            current_distance = new_distance
-            current_time = new_time
-            accepted = True
-
-        # Update the best solution found
-        if current_score < best_score:
-            best_solution = copy.deepcopy(current_solution)
-            best_score = current_score
-
-        # Logging for debugging
-        # print(f"Iteration {iteration + 1}, Temp: {temperature:.2f}, Current Score: {current_score:.2f}, "
-        #       f"Best Score: {best_score:.2f}, Current Distance: {current_distance:.2f}, "
-        #       f"Current Time: {current_time:.2f}, Accepted: {'Yes' if accepted else 'No'}")
-
-        temperature *= cooling_rate
-
-    return best_solution, best_score
+    return best
 
 
-# JSON input for vehicles and orders
-data = """
-{
-    "vehicles": [
-        {"id": 1, "capacity_weight": 10000, "capacity_volume": 20000},
-        {"id": 2, "capacity_weight": 10000, "capacity_volume": 20000}
-    ],
-    "orders": [
-        {
-            "id": 1,
-            "weight": 20.73938417905054,
-            "volume": 84.87458258706378,
-            "location": {
-                "lat": 10.447042118520102,
-                "lng": 93.64875252870615
-            }
-        },
-        {
-            "id": 2,
-            "weight": 6.142835085124508,
-            "volume": 24.588470656828395,
-            "location": {
-                "lat": 18.867962678748306,
-                "lng": 83.02193878023306
-            }
-        },
-        {
-            "id": 3,
-            "weight": 8.475416306910688,
-            "volume": 56.22456076405092,
-            "location": {
-                "lat": 9.57660529610817,
-                "lng": 73.44336082327405
-            }
-        },
-        {
-            "id": 4,
-            "weight": 38.164317515512295,
-            "volume": 89.59239851137805,
-            "location": {
-                "lat": 9.458337951922683,
-                "lng": 91.74984723605762
-            }
-        },
-        {
-            "id": 5,
-            "weight": 18.57700001567364,
-            "volume": 87.27339403855277,
-            "location": {
-                "lat": 16.410758044942718,
-                "lng": 77.5357838744415
-            }
-        },
-        {
-            "id": 6,
-            "weight": 38.257114593141644,
-            "volume": 47.553828954867,
-            "location": {
-                "lat": 21.141940558011964,
-                "lng": 74.32151267457309
-            }
-        },
-        {
-            "id": 7,
-            "weight": 38.59982248458614,
-            "volume": 63.48793551290433,
-            "location": {
-                "lat": 10.041052858989511,
-                "lng": 89.94011730267134
-            }
-        },
-        {
-            "id": 8,
-            "weight": 49.72577766996663,
-            "volume": 78.24761807241124,
-            "location": {
-                "lat": 9.327731859708964,
-                "lng": 83.918508944758
-            }
-        },
-        {
-            "id": 9,
-            "weight": 49.89285355817644,
-            "volume": 44.48895129256209,
-            "location": {
-                "lat": 14.988419969420319,
-                "lng": 89.19426116435189
-            }
-        },
-        {
-            "id": 10,
-            "weight": 18.102459133010974,
-            "volume": 88.92249994915714,
-            "location": {
-                "lat": 16.660910261426334,
-                "lng": 90.954526746835
-            }
-        },
-        {
-            "id": 11,
-            "weight": 18.440317614373434,
-            "volume": 48.29519310800534,
-            "location": {
-                "lat": 11.444290422284336,
-                "lng": 94.84331552055124
-            }
-        },
-        {
-            "id": 12,
-            "weight": 17.483332409077285,
-            "volume": 90.92786175343146,
-            "location": {
-                "lat": 18.301891875138452,
-                "lng": 74.2861461005201
-            }
-        },
-        {
-            "id": 13,
-            "weight": 44.50417587559284,
-            "volume": 37.27130593918963,
-            "location": {
-                "lat": 11.91655768678709,
-                "lng": 78.15280599041515
-            }
-        },
-        {
-            "id": 14,
-            "weight": 13.45097426681456,
-            "volume": 19.32167994183122,
-            "location": {
-                "lat": 14.80941808276926,
-                "lng": 90.53022637412435
-            }
-        },
-        {
-            "id": 15,
-            "weight": 6.320539433192794,
-            "volume": 66.29320412505244,
-            "location": {
-                "lat": 9.394851070061524,
-                "lng": 84.23871185440808
-            }
-        },
-        {
-            "id": 16,
-            "weight": 33.73329616294217,
-            "volume": 87.58623885093766,
-            "location": {
-                "lat": 21.314090604020027,
-                "lng": 73.44261502293335
-            }
-        },
-        {
-            "id": 17,
-            "weight": 26.056673210780115,
-            "volume": 67.69889770199428,
-            "location": {
-                "lat": 10.165896962744895,
-                "lng": 89.45583550070288
-            }
-        },
-        {
-            "id": 18,
-            "weight": 40.92738279683582,
-            "volume": 30.17767071965818,
-            "location": {
-                "lat": 18.048656557039095,
-                "lng": 72.91174728177106
-            }
-        },
-        {
-            "id": 19,
-            "weight": 40.25310784066673,
-            "volume": 66.69515265994892,
-            "location": {
-                "lat": 8.393014975446238,
-                "lng": 89.38909617973388
-            }
-        },
-        {
-            "id": 20,
-            "weight": 18.624167994475158,
-            "volume": 68.57347889795048,
-            "location": {
-                "lat": 11.246679694682108,
-                "lng": 82.60526864979433
-            }
-        },
-        {
-            "id": 21,
-            "weight": 34.79621360650755,
-            "volume": 70.31845991566527,
-            "location": {
-                "lat": 10.80128830904747,
-                "lng": 76.22270504237508
-            }
-        },
-        {
-            "id": 22,
-            "weight": 25.238077956267336,
-            "volume": 19.11545672815287,
-            "location": {
-                "lat": 14.460353830125065,
-                "lng": 96.85292739343944
-            }
-        },
-        {
-            "id": 23,
-            "weight": 43.730957106024945,
-            "volume": 64.33430409890384,
-            "location": {
-                "lat": 9.949046684078697,
-                "lng": 85.2832396348771
-            }
-        },
-        {
-            "id": 24,
-            "weight": 33.14472021497984,
-            "volume": 94.89274320705313,
-            "location": {
-                "lat": 17.51738381025215,
-                "lng": 70.04797539929102
-            }
-        },
-        {
-            "id": 25,
-            "weight": 21.407177854652783,
-            "volume": 11.864792326397943,
-            "location": {
-                "lat": 11.599674028986762,
-                "lng": 69.49118173862756
-            }
-        },
-        {
-            "id": 26,
-            "weight": 46.25607192901187,
-            "volume": 94.6582003777504,
-            "location": {
-                "lat": 12.021171729774515,
-                "lng": 72.40802995890286
-            }
-        },
-        {
-            "id": 27,
-            "weight": 17.76692132574544,
-            "volume": 85.22346724076907,
-            "location": {
-                "lat": 14.331042818562567,
-                "lng": 77.03617559806811
-            }
-        },
-        {
-            "id": 28,
-            "weight": 17.922930775550185,
-            "volume": 71.69616913919837,
-            "location": {
-                "lat": 11.051359923189036,
-                "lng": 68.97268944895737
-            }
-        },
-        {
-            "id": 29,
-            "weight": 37.852751100542555,
-            "volume": 60.04804687594995,
-            "location": {
-                "lat": 14.522995078743955,
-                "lng": 91.24320550452438
-            }
-        },
-        {
-            "id": 30,
-            "weight": 8.726645702068712,
-            "volume": 26.794804223799144,
-            "location": {
-                "lat": 18.852737157921048,
-                "lng": 75.74082554201874
-            }
-        },
-        {
-            "id": 31,
-            "weight": 11.591401230566579,
-            "volume": 83.31052176046629,
-            "location": {
-                "lat": 21.728459865663275,
-                "lng": 69.11463875086288
-            }
-        },
-        {
-            "id": 32,
-            "weight": 16.045892098672667,
-            "volume": 20.345817764277548,
-            "location": {
-                "lat": 9.738472079619996,
-                "lng": 89.30572949448744
-            }
-        },
-        {
-            "id": 33,
-            "weight": 19.891195499668477,
-            "volume": 33.4666012968832,
-            "location": {
-                "lat": 18.19214568702179,
-                "lng": 70.81101888655654
-            }
-        },
-        {
-            "id": 34,
-            "weight": 5.71985141570169,
-            "volume": 36.73534877740143,
-            "location": {
-                "lat": 15.765385306083855,
-                "lng": 78.28319396977044
-            }
-        },
-        {
-            "id": 35,
-            "weight": 7.471852658979408,
-            "volume": 40.380777692660615,
-            "location": {
-                "lat": 21.50696625322729,
-                "lng": 83.1948976988287
-            }
-        },
-        {
-            "id": 36,
-            "weight": 30.321830135532437,
-            "volume": 68.62765037336712,
-            "location": {
-                "lat": 16.482925659077452,
-                "lng": 89.58173053293305
-            }
-        },
-        {
-            "id": 37,
-            "weight": 12.154054662752579,
-            "volume": 18.32500428639789,
-            "location": {
-                "lat": 9.468838707372614,
-                "lng": 90.60845127662607
-            }
-        },
-        {
-            "id": 38,
-            "weight": 36.9486923557182,
-            "volume": 36.618489773762064,
-            "location": {
-                "lat": 20.054605262179685,
-                "lng": 94.96251304352847
-            }
-        },
-        {
-            "id": 39,
-            "weight": 49.42517134855786,
-            "volume": 45.246565090245824,
-            "location": {
-                "lat": 14.200335240628249,
-                "lng": 92.41932407048995
-            }
-        },
-        {
-            "id": 40,
-            "weight": 12.506811565505178,
-            "volume": 69.92888421249086,
-            "location": {
-                "lat": 14.620278331243338,
-                "lng": 91.77484344292884
-            }
-        },
-        {
-            "id": 41,
-            "weight": 41.56736584717082,
-            "volume": 87.35192952439697,
-            "location": {
-                "lat": 15.387912411205653,
-                "lng": 92.15838031134189
-            }
-        },
-        {
-            "id": 42,
-            "weight": 31.7145384286308,
-            "volume": 86.24786622282241,
-            "location": {
-                "lat": 13.94465530149839,
-                "lng": 88.3916074127467
-            }
-        },
-        {
-            "id": 43,
-            "weight": 12.546245774524483,
-            "volume": 61.822671100629556,
-            "location": {
-                "lat": 18.314132407770458,
-                "lng": 96.54783202251927
-            }
-        },
-        {
-            "id": 44,
-            "weight": 22.095734813214005,
-            "volume": 85.3094056334951,
-            "location": {
-                "lat": 11.86259621499251,
-                "lng": 72.17256296169873
-            }
-        },
-        {
-            "id": 45,
-            "weight": 34.78582192633645,
-            "volume": 75.31127945313403,
-            "location": {
-                "lat": 16.813603157000394,
-                "lng": 91.43201522772364
-            }
-        },
-        {
-            "id": 46,
-            "weight": 15.011189628301803,
-            "volume": 41.698840620480496,
-            "location": {
-                "lat": 9.749710708908275,
-                "lng": 91.40421621437008
-            }
-        },
-        {
-            "id": 47,
-            "weight": 7.774614226103542,
-            "volume": 16.339456708702937,
-            "location": {
-                "lat": 11.463609852659351,
-                "lng": 75.30710415661088
-            }
-        },
-        {
-            "id": 48,
-            "weight": 44.29759069417374,
-            "volume": 53.06943538879376,
-            "location": {
-                "lat": 11.312039941741716,
-                "lng": 91.59115032827609
-            }
-        },
-        {
-            "id": 49,
-            "weight": 6.115670336418264,
-            "volume": 17.018006284924603,
-            "location": {
-                "lat": 10.487117105718912,
-                "lng": 69.61943164738894
-            }
-        },
-        {
-            "id": 50,
-            "weight": 10.31664144210107,
-            "volume": 80.52817834249629,
-            "location": {
-                "lat": 20.376421387381956,
-                "lng": 94.78919005068197
-            }
-        },
-        {
-            "id": 51,
-            "weight": 36.2173960796671,
-            "volume": 51.92742713017032,
-            "location": {
-                "lat": 12.031411014479037,
-                "lng": 72.57659644028976
-            }
-        },
-        {
-            "id": 52,
-            "weight": 26.492160484401108,
-            "volume": 78.34054923297076,
-            "location": {
-                "lat": 19.39264306855928,
-                "lng": 87.46369572072621
-            }
-        },
-        {
-            "id": 53,
-            "weight": 44.46235433888916,
-            "volume": 25.390659393264656,
-            "location": {
-                "lat": 13.555434174455552,
-                "lng": 75.30487621539729
-            }
-        },
-        {
-            "id": 54,
-            "weight": 21.86236996035619,
-            "volume": 34.51375887990133,
-            "location": {
-                "lat": 19.672193337775344,
-                "lng": 81.94656730813873
-            }
-        },
-        {
-            "id": 55,
-            "weight": 25.278322397152298,
-            "volume": 90.7526600142256,
-            "location": {
-                "lat": 10.050472398877934,
-                "lng": 86.54090251226613
-            }
-        },
-        {
-            "id": 56,
-            "weight": 38.587571806554124,
-            "volume": 67.95529690330648,
-            "location": {
-                "lat": 21.310756113123844,
-                "lng": 87.84623336294456
-            }
-        },
-        {
-            "id": 57,
-            "weight": 45.791338597678376,
-            "volume": 18.36675107609279,
-            "location": {
-                "lat": 13.421811299062224,
-                "lng": 71.58599537295233
-            }
-        },
-        {
-            "id": 58,
-            "weight": 43.85043067327145,
-            "volume": 64.33824038932649,
-            "location": {
-                "lat": 18.47319100130612,
-                "lng": 93.81452093596852
-            }
-        },
-        {
-            "id": 59,
-            "weight": 6.164864881601823,
-            "volume": 54.76289465927066,
-            "location": {
-                "lat": 8.655004891607568,
-                "lng": 85.06269351672778
-            }
-        },
-        {
-            "id": 60,
-            "weight": 21.854707337363212,
-            "volume": 64.42695365030565,
-            "location": {
-                "lat": 8.137293085669008,
-                "lng": 73.82267947655826
-            }
-        },
-        {
-            "id": 61,
-            "weight": 7.69309757557027,
-            "volume": 83.34097285968046,
-            "location": {
-                "lat": 20.050365761381762,
-                "lng": 87.41017978626871
-            }
-        },
-        {
-            "id": 62,
-            "weight": 20.630512465757466,
-            "volume": 73.12211651095382,
-            "location": {
-                "lat": 10.015083303269321,
-                "lng": 86.27529826767872
-            }
-        },
-        {
-            "id": 63,
-            "weight": 49.07393613413487,
-            "volume": 26.55439858460085,
-            "location": {
-                "lat": 21.218081512647746,
-                "lng": 73.55205341986075
-            }
-        },
-        {
-            "id": 64,
-            "weight": 30.35558973577522,
-            "volume": 41.9111821409728,
-            "location": {
-                "lat": 15.4431391372935,
-                "lng": 84.96508137013389
-            }
-        },
-        {
-            "id": 65,
-            "weight": 49.148146092756015,
-            "volume": 51.17734944664295,
-            "location": {
-                "lat": 20.466450948097865,
-                "lng": 90.37663755852734
-            }
-        },
-        {
-            "id": 66,
-            "weight": 34.13626552844701,
-            "volume": 16.48926150187361,
-            "location": {
-                "lat": 18.575649887579313,
-                "lng": 86.48506194204342
-            }
-        },
-        {
-            "id": 67,
-            "weight": 46.92964503015372,
-            "volume": 99.97990273417113,
-            "location": {
-                "lat": 20.181564534184012,
-                "lng": 73.16408184616675
-            }
-        },
-        {
-            "id": 68,
-            "weight": 35.09252091718219,
-            "volume": 49.76610189500036,
-            "location": {
-                "lat": 15.15776863684027,
-                "lng": 76.50154650376268
-            }
-        },
-        {
-            "id": 69,
-            "weight": 12.835308017211123,
-            "volume": 98.23843637145632,
-            "location": {
-                "lat": 20.714885076380124,
-                "lng": 69.5773109498052
-            }
-        },
-        {
-            "id": 70,
-            "weight": 18.46352603120105,
-            "volume": 78.90202777085193,
-            "location": {
-                "lat": 15.50407828801741,
-                "lng": 73.19874287382429
-            }
-        },
-        {
-            "id": 71,
-            "weight": 14.935570989728587,
-            "volume": 46.435039832723916,
-            "location": {
-                "lat": 19.9472738453722,
-                "lng": 79.86951365542537
-            }
-        },
-        {
-            "id": 72,
-            "weight": 33.99362194956747,
-            "volume": 76.88706152236679,
-            "location": {
-                "lat": 15.302854934062049,
-                "lng": 73.67755944096317
-            }
-        },
-        {
-            "id": 73,
-            "weight": 32.94367340963035,
-            "volume": 30.50208602140743,
-            "location": {
-                "lat": 13.038553265403252,
-                "lng": 96.31365479217347
-            }
-        },
-        {
-            "id": 74,
-            "weight": 14.091828315766762,
-            "volume": 38.23990476543296,
-            "location": {
-                "lat": 16.408339348712055,
-                "lng": 71.18587938990821
-            }
-        },
-        {
-            "id": 75,
-            "weight": 23.498612281204437,
-            "volume": 64.50768259543241,
-            "location": {
-                "lat": 16.699356350917732,
-                "lng": 84.10151357888313
-            }
-        },
-        {
-            "id": 76,
-            "weight": 11.125495939512021,
-            "volume": 65.7154990598026,
-            "location": {
-                "lat": 17.812570276971062,
-                "lng": 93.58156873284031
-            }
-        },
-        {
-            "id": 77,
-            "weight": 48.52141076650716,
-            "volume": 96.6720768036044,
-            "location": {
-                "lat": 19.46355316244928,
-                "lng": 87.39522464287434
-            }
-        },
-        {
-            "id": 78,
-            "weight": 30.15831152578766,
-            "volume": 73.64054894647953,
-            "location": {
-                "lat": 15.351559835056658,
-                "lng": 90.3202323599809
-            }
-        },
-        {
-            "id": 79,
-            "weight": 24.950666368598913,
-            "volume": 87.55624207877733,
-            "location": {
-                "lat": 13.567238350894762,
-                "lng": 76.89773938273044
-            }
-        },
-        {
-            "id": 80,
-            "weight": 32.005326298763435,
-            "volume": 67.82882151330922,
-            "location": {
-                "lat": 10.547735569446576,
-                "lng": 68.2165995645344
-            }
-        },
-        {
-            "id": 81,
-            "weight": 21.069315022663147,
-            "volume": 42.825697266043875,
-            "location": {
-                "lat": 19.109625508798572,
-                "lng": 68.78976007107218
-            }
-        },
-        {
-            "id": 82,
-            "weight": 34.32710922417785,
-            "volume": 93.77414994453493,
-            "location": {
-                "lat": 18.4595162501901,
-                "lng": 86.74963041645404
-            }
-        },
-        {
-            "id": 83,
-            "weight": 22.987082056920496,
-            "volume": 77.94042559722124,
-            "location": {
-                "lat": 12.51234917848998,
-                "lng": 73.54464280265292
-            }
-        },
-        {
-            "id": 84,
-            "weight": 21.498334238673387,
-            "volume": 38.50005954996208,
-            "location": {
-                "lat": 12.875495667435931,
-                "lng": 87.65779120910213
-            }
-        },
-        {
-            "id": 85,
-            "weight": 41.42172312498415,
-            "volume": 70.68022618015502,
-            "location": {
-                "lat": 9.894478288456975,
-                "lng": 70.45808581578702
-            }
-        },
-        {
-            "id": 86,
-            "weight": 34.29123721692863,
-            "volume": 72.16858739875548,
-            "location": {
-                "lat": 21.131215092122574,
-                "lng": 79.89279242090788
-            }
-        },
-        {
-            "id": 87,
-            "weight": 18.290083094479368,
-            "volume": 25.244693930812797,
-            "location": {
-                "lat": 9.959744649005005,
-                "lng": 81.0638689236266
-            }
-        },
-        {
-            "id": 88,
-            "weight": 32.549016833524476,
-            "volume": 24.455117202030333,
-            "location": {
-                "lat": 18.451652182666713,
-                "lng": 80.76812021082078
-            }
-        },
-        {
-            "id": 89,
-            "weight": 23.32608268355414,
-            "volume": 48.48124160445959,
-            "location": {
-                "lat": 17.23965898857198,
-                "lng": 71.35349873420675
-            }
-        },
-        {
-            "id": 90,
-            "weight": 10.918635815739858,
-            "volume": 17.350054414367072,
-            "location": {
-                "lat": 21.12304435583316,
-                "lng": 92.97870892893424
-            }
-        },
-        {
-            "id": 91,
-            "weight": 47.84152037033997,
-            "volume": 53.99501445034519,
-            "location": {
-                "lat": 15.552219047678971,
-                "lng": 96.67331015679054
-            }
-        },
-        {
-            "id": 92,
-            "weight": 41.55690377334896,
-            "volume": 29.309239541671957,
-            "location": {
-                "lat": 14.900770962729759,
-                "lng": 90.93015260925577
-            }
-        },
-        {
-            "id": 93,
-            "weight": 21.14849211721862,
-            "volume": 63.436015090004624,
-            "location": {
-                "lat": 8.830627470839536,
-                "lng": 76.04864991272902
-            }
-        },
-        {
-            "id": 94,
-            "weight": 24.855481589448203,
-            "volume": 73.21520024593454,
-            "location": {
-                "lat": 13.898051335511425,
-                "lng": 87.64875698797238
-            }
-        },
-        {
-            "id": 95,
-            "weight": 15.976617473642365,
-            "volume": 54.59335391111676,
-            "location": {
-                "lat": 8.07917256176613,
-                "lng": 93.86154149197293
-            }
-        },
-        {
-            "id": 96,
-            "weight": 17.098538528439587,
-            "volume": 68.18398285710654,
-            "location": {
-                "lat": 16.030202499214848,
-                "lng": 83.84883143693307
-            }
-        },
-        {
-            "id": 97,
-            "weight": 15.929599668420675,
-            "volume": 68.12537922469,
-            "location": {
-                "lat": 9.771284883036136,
-                "lng": 94.78041579913824
-            }
-        },
-        {
-            "id": 98,
-            "weight": 5.513442441891588,
-            "volume": 69.43670491850555,
-            "location": {
-                "lat": 14.498977591771322,
-                "lng": 69.59154692784719
-            }
-        },
-        {
-            "id": 99,
-            "weight": 47.03460207679615,
-            "volume": 38.66733617790114,
-            "location": {
-                "lat": 11.51090513360148,
-                "lng": 69.36794505471678
-            }
-        },
-        {
-            "id": 100,
-            "weight": 11.465234251902428,
-            "volume": 26.51909575610689,
-            "location": {
-                "lat": 11.133001594894088,
-                "lng": 92.27721592918265
-            }
-        }
-    ],
-     "depot_location": {"lat": 12.9716, "lng": 77.5946}
-}
-"""
+def plot_routes(solution: Dict[int, List[Order]], vehicles: List[Vehicle], show_labels: bool = True):
+    plt.figure(figsize=(10, 8))
+    cmap = plt.cm.get_cmap('tab10')
+    jitter_amt = 0.05
+    hulls = []
 
-# Load the data
-data = json.loads(data)
-vehicles = data["vehicles"]
-orders = data["orders"]
-depot_location = data["depot_location"]
+    for v in vehicles:
+        route = [v.start] + [pt for o in solution[v.id] for pt in [o.pickup, o.delivery]] + [v.end]
+        lat = [pt.lat + random.uniform(-jitter_amt, jitter_amt) for pt in route]
+        lon = [pt.lon + random.uniform(-jitter_amt, jitter_amt) for pt in route]
+        color = cmap(v.id % 10)
 
-# Parameters for simulated annealing
-initial_temp = 10000
-cooling_rate = 0.995
-max_iterations = 10000
-weight_distance = 0.5  # Weight for distance constraint
-weight_time = 0.5  # Weight for time constraint
+        plt.plot(lon, lat, marker='o', label=f'Vehicle {v.id}', alpha=0.7, color=color)
 
-best_solution, best_score = simulated_annealing(
-    vehicles,
-    orders,
-    depot_location,
-    initial_temp,
-    cooling_rate,
-    max_iterations,
-    weight_distance,
-    weight_time,
-)
+        if show_labels:
+            for i, pt in enumerate(route):
+                plt.text(lon[i], lat[i], str(pt.id), fontsize=7, alpha=0.9)
 
-print("Best solution found:", best_solution)
-print("Best score:", best_score)
+        hull = compute_convex_hull(route)
+        hulls.append((hull, color))
+
+    # Plot convex hulls
+    for hull, color in hulls:
+        if hasattr(hull, 'exterior'):
+            x, y = hull.exterior.xy
+            plt.fill(x, y, alpha=0.1, color=color, edgecolor='black')
+
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.grid(True)
+    plt.legend()
+    plt.title('Vehicle Routes with Convex Hulls & Overlap Visualization')
+    plt.show()
+
+
+
+# ---- Example Run ----
+
+if __name__ == '__main__':
+    city_coords = {
+        "Indore": (22.7196, 75.8577),
+        "Chennai": (13.0827, 80.2707),
+        "Hyderabad": (17.3850, 78.4867),
+        "Mysore": (12.2958, 76.6394),
+        "Bangalore": (12.9716, 77.5946),
+        "Asansol": (23.6739, 86.9524),
+        "Lucknow": (26.8467, 80.9462),
+        "Mumbai": (19.0760, 72.8777),
+        "Mangalore": (12.9141, 74.8560),
+        "Coimbatore": (11.0168, 76.9558),
+    }
+
+    city_locations = {name: Location(i, lat, lon) for i, (name, (lat, lon)) in enumerate(city_coords.items())}
+    city_list = list(city_locations.values())
+
+    depot = city_locations["Indore"]
+    orders = []
+
+    for i in range(500):
+        pickup, delivery = random.sample(city_list, 2)
+        orders.append(Order(i, pickup, delivery, time_window=(0, 100), demand=1))
+
+    vehicles = [Vehicle(i, 10, depot, depot) for i in range(5)]
+
+    # Register locations for ID consistency
+    location_map = {}
+    counter = 0
+
+    def register(loc: Location):
+        global counter
+        key = (loc.lat, loc.lon)
+        if key not in location_map:
+            loc.id = counter
+            location_map[key] = loc
+            counter += 1
+        else:
+            loc.id = location_map[key].id
+        return loc
+
+    for order in orders:
+        order.pickup = register(order.pickup)
+        order.delivery = register(order.delivery)
+    for v in vehicles:
+        v.start = register(v.start)
+        v.end = register(v.end)
+
+    distance_matrix = build_distance_matrix(list(location_map.values()))
+
+    solution = simulated_annealing(orders, vehicles)
+    for vid, ords in solution.items():
+        print(f"Vehicle {vid}: {[o.id for o in ords]}")
+    plot_routes(solution, vehicles)
+
+    
+# if __name__ == '__main__':
+#     depot = Location(0, 28.6139, 77.2090)  # Delhi as depot
+#     orders = [
+#         Order(i,
+#               Location(i, random.uniform(8.0, 37.0), random.uniform(68.0, 97.0)),
+#               Location(i+100, random.uniform(8.0, 37.0), random.uniform(68.0, 97.0)),
+#               (0, 100), 1)
+#         for i in range(100)
+#     ]
+#     vehicles = [Vehicle(i, 5, depot, depot) for i in range(3)]
+#     # 
+#     location_map = {}
+#     counter = 0
+
+#     def register(loc: Location):
+#         global counter
+#         key = (loc.lat, loc.lon)
+#         if key not in location_map:
+#             loc.id = counter
+#             location_map[key] = loc
+#             counter += 1
+#         else:
+#             loc.id = location_map[key].id
+#         return loc
+
+#     for order in orders:
+#         order.pickup = register(order.pickup)
+#         order.delivery = register(order.delivery)
+#     for v in vehicles:
+#         v.start = register(v.start)
+#         v.end = register(v.end)
+
+#     distance_matrix = build_distance_matrix(list(location_map.values()))
+#     # 
+#     solution = simulated_annealing(orders, vehicles)
+#     for vid, ords in solution.items():
+#         print(f"Vehicle {vid}: {[o.id for o in ords]}")
+#     plot_routes(solution, vehicles)
